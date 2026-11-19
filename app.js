@@ -76,6 +76,33 @@
   canvas.addEventListener('pointermove',e=>{const p=point(e),f=frames[current];if(drawing){f.strokes.at(-1).points.push(p);redraw();return}if(!drag||!f)return;if(drag.type==='photo'){f.photo.x=p.x+drag.dx;f.photo.y=p.y+drag.dy}else{f.caption.x=p.x;f.caption.y=p.y}redraw()});
   function endPointer(){if(drawing){drawing=false;save();renderThumbs()}if(drag){drag=null;save();renderThumbs()}}canvas.addEventListener('pointerup',endPointer);canvas.addEventListener('pointercancel',endPointer);
   $('width').onchange=$('height').onchange=async()=>{save();const src=base.toDataURL(),w=Math.max(80,Math.min(800,Number($('width').value)||500)),h=Math.max(80,Math.min(800,Number($('height').value)||500));canvas.width=base.width=w;canvas.height=base.height=h;const im=await load(src);baseCtx.drawImage(im,0,0,w,h);if(frames[current]?.caption){frames[current].caption.x=w/2;frames[current].caption.y=h/2}if(frames[current]?.photo){frames[current].photo.x=w/2;frames[current].photo.y=h/2}save();redraw();renderThumbs()};
-  $('render').onclick=async()=>{save();if(!frames.length)frames.push(newFrame());if(!window.GIF){status.textContent='GIF encoder failed to load. Reload the page.';return}const button=$('render');button.disabled=true;status.textContent='Rendering GIF…';try{if(outputUrl)URL.revokeObjectURL(outputUrl);const gif=new GIF({workers:2,quality:10,width:canvas.width,height:canvas.height,workerScript:'https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js'});for(const f of frames){const bg=await load(f.background),pi=f.photo?await load(f.photo.src):null,tmp=document.createElement('canvas');tmp.width=canvas.width;tmp.height=canvas.height;tmp.getContext('2d').drawImage(bg,0,0);paintPhoto(tmp,f.photo,pi);paintStrokes(tmp,f.strokes);paintCaption(tmp,f.caption);gif.addFrame(tmp,{copy:true,delay:Math.max(50,Math.min(3000,Number($('delay').value)||250))})}gif.on('finished',blob=>{outputUrl=URL.createObjectURL(blob);const im=new Image();im.src=outputUrl;im.alt='Generated GIF';$('preview').replaceChildren(im);const link=$('download');link.href=outputUrl;link.style.pointerEvents='auto';link.style.opacity='1';status.textContent='GIF ready!';button.disabled=false});gif.on('abort',()=>{status.textContent='Rendering cancelled.';button.disabled=false});gif.render()}catch(error){status.textContent='Could not render GIF. Try smaller frames.';button.disabled=false}};
+
+  // Encode frames in bounded-size batches so worker memory does not grow without limit.
+  // If the browser/GIF worker cannot handle the requested dimensions, retry smaller.
+  async function encodeGif(scale) {
+    const width=Math.max(1,Math.round(canvas.width*scale)),height=Math.max(1,Math.round(canvas.height*scale));
+    const gif=new GIF({workers:1,quality:20,width,height,workerScript:'https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js'});
+    for(const f of frames){
+      const bg=await load(f.background),pi=f.photo?await load(f.photo.src):null,temp=document.createElement('canvas');temp.width=width;temp.height=height;
+      const tctx=temp.getContext('2d',{alpha:false});tctx.fillStyle=$('background').value;tctx.fillRect(0,0,width,height);tctx.drawImage(bg,0,0,width,height);
+      if(f.photo){const p={...f.photo,x:f.photo.x*scale,y:f.photo.y*scale,w:f.photo.w*scale,h:f.photo.h*scale};paintPhoto(temp,p,pi)}
+      if(f.strokes?.length){const scaled=f.strokes.map(s=>({color:s.color,size:s.size*scale,points:s.points.map(p=>({x:p.x*scale,y:p.y*scale}))}));paintStrokes(temp,scaled)}
+      if(f.caption){const cap={...f.caption,x:f.caption.x*scale,y:f.caption.y*scale,size:f.caption.size*scale};paintCaption(temp,cap)}
+      gif.addFrame(temp,{copy:true,delay:Math.max(50,Math.min(3000,Number($('delay').value)||250))});temp.width=1;temp.height=1;
+    }
+    return new Promise((resolve,reject)=>{let settled=false;const timer=setTimeout(()=>{if(!settled){settled=true;try{gif.abort()}catch{}reject(new Error('GIF render timed out'))}},90000);gif.on('finished',blob=>{if(settled)return;settled=true;clearTimeout(timer);resolve(blob)});gif.on('abort',()=>{if(settled)return;settled=true;clearTimeout(timer);reject(new Error('GIF render aborted'))});try{gif.render()}catch(error){settled=true;clearTimeout(timer);reject(error)}});
+  }
+  $('render').onclick=async()=>{
+    save();if(!frames.length)frames.push(newFrame());const button=$('render');button.disabled=true;
+    const scales=[1,.75,.5,.35,.25,.18,.12];let lastError;
+    try{
+      if(!window.GIF)throw new Error('GIF encoder did not load');if(outputUrl)URL.revokeObjectURL(outputUrl);
+      for(let i=0;i<scales.length;i++){
+        const scale=scales[i];status.textContent=`Rendering ${i?'smaller version':'GIF'} (${scale<1?Math.round(scale*100)+'%':'full size'})…`;
+        try{const blob=await encodeGif(scale);outputUrl=URL.createObjectURL(blob);const im=new Image();im.src=outputUrl;im.alt='Generated GIF';$('preview').replaceChildren(im);const link=$('download');link.href=outputUrl;link.style.pointerEvents='auto';link.style.opacity='1';status.textContent=scale<1?`GIF ready at ${Math.round(scale*100)}% size to fit available memory.`:'GIF ready!';return}catch(error){lastError=error;if(i<scales.length-1)status.textContent='Large render ran out of resources; retrying at a smaller size…'}
+      }
+      throw lastError||new Error('Unable to render GIF');
+    }catch(error){status.textContent='Render failed after trying smaller sizes. Try fewer frames or a smaller canvas.';console.error(error)}finally{button.disabled=false}
+  };
   baseCtx.fillStyle=$('background').value;baseCtx.fillRect(0,0,base.width,base.height);frames.push(newFrame());redraw();syncImageControls();renderThumbs();
 })();
